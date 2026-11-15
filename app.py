@@ -1,36 +1,54 @@
-import os
-from flask import Flask, jsonify, request, render_template
-from database import init_db, get_db, close_db, utc_now, parse_datetime, canonical_json
-from datetime import datetime, timezone, timedelta
-from email_validator import validate_email, EmailNotValidError
 import hashlib
 import json
+import os
 import uuid
+from datetime import datetime, timezone, timedelta
+
 from dotenv import load_dotenv
+from email_validator import validate_email, EmailNotValidError
+from flask import Flask, jsonify, request, render_template
+from sqlalchemy import select, delete, func, text, update
+from sqlalchemy.exc import IntegrityError
+
+from database import (
+    db, init_db, get_db, utc_now, parse_datetime, canonical_json,
+    normalize_database_url,
+)
+from models import Slot, Booking, IdempotencyRecord, RateLimitAttempt
 
 load_dotenv()
 
+
 def create_app(test_config=None):
-    app = Flask(__name__)
+    app = Flask(__name__, instance_relative_config=True)
+
+    default_db = "sqlite:///" + os.path.join(app.instance_path, "clinic.sqlite3").replace("\\", "/")
+    database_url = normalize_database_url(os.environ.get("DATABASE_URL", default_db))
+
     app.config.update(
-        DATABASE=os.environ.get("DATABASE_PATH", os.path.join(app.instance_path, "clinic.sqlite3")),
+        SQLALCHEMY_DATABASE_URI=database_url,
+        SQLALCHEMY_TRACK_MODIFICATIONS=False,
         API_KEY=os.environ.get("API_KEY", "dev-secret-change-me"),
         RATE_LIMIT=5,
         RATE_WINDOW_SECONDS=60,
     )
     if test_config:
         app.config.update(test_config)
+        if app.config.get("DATABASE"):
+            app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///" + str(app.config["DATABASE"]).replace("\\", "/")
+        if app.config.get("DATABASE_URL"):
+            app.config["SQLALCHEMY_DATABASE_URI"] = normalize_database_url(app.config["DATABASE_URL"])
 
-    os.makedirs(os.path.dirname(app.config["DATABASE"]) or ".", exist_ok=True)
-    init_db(app.config["DATABASE"])
-    app.teardown_appcontext(close_db)
+    if app.config["SQLALCHEMY_DATABASE_URI"].startswith("sqlite:///"):
+        os.makedirs(app.instance_path, exist_ok=True)
+
+    init_db(app)
 
     def error(message, status):
         return jsonify({"error": message}), status
 
     @app.before_request
     def require_api_key():
-        # The HTML page is public; all /api routes and documented endpoints are protected.
         if request.path == "/" or request.path.startswith("/static/"):
             return None
         if request.headers.get("X-API-Key") != app.config["API_KEY"]:
@@ -67,46 +85,46 @@ def create_app(test_config=None):
                 return error("end must be after start", 400)
             normalized.append((sid, slot["provider"].strip(), start.isoformat(), end.isoformat()))
 
-        db = get_db(app)
         try:
-            db.execute("BEGIN IMMEDIATE")
-            db.execute("DELETE FROM bookings")
-            db.execute("DELETE FROM slots")
-            db.execute("DELETE FROM idempotency")
-            db.executemany(
-                "INSERT INTO slots (id, provider, start, end) VALUES (?, ?, ?, ?)",
-                normalized,
-            )
-            db.commit()
+            # Delete dependent records first so reset works on both databases.
+            db.session.execute(delete(Booking))
+            db.session.execute(delete(Slot))
+            db.session.execute(delete(IdempotencyRecord))
+            db.session.add_all([
+                Slot(id=sid, provider=provider, start=start, end=end)
+                for sid, provider, start, end in normalized
+            ])
+            db.session.commit()
         except Exception:
-            db.rollback()
+            db.session.rollback()
             raise
         return jsonify({"message": "slots replaced", "count": len(normalized)}), 200
 
     @app.get("/slots")
     def list_slots():
         provider = request.args.get("provider")
-        db = get_db(app)
-        if provider is None:
-            rows = db.execute("""
-                SELECT s.*, CASE WHEN EXISTS (
-                    SELECT 1 FROM bookings b
-                    WHERE b.slot_id=s.id AND b.status='confirmed'
-                ) THEN 0 ELSE 1 END AS available
-                FROM slots s ORDER BY s.start ASC, s.id ASC
-            """).fetchall()
-        else:
-            rows = db.execute("""
-                SELECT s.*, CASE WHEN EXISTS (
-                    SELECT 1 FROM bookings b
-                    WHERE b.slot_id=s.id AND b.status='confirmed'
-                ) THEN 0 ELSE 1 END AS available
-                FROM slots s WHERE s.provider=? ORDER BY s.start ASC, s.id ASC
-            """, (provider,)).fetchall()
+        query = (
+            db.session.query(
+                Slot,
+                (
+                    ~db.session.query(Booking.id)
+                    .filter(Booking.slot_id == Slot.id, Booking.status == "confirmed")
+                    .exists()
+                ).label("available"),
+            )
+        )
+        if provider is not None:
+            query = query.filter(Slot.provider == provider)
+        rows = query.order_by(Slot.start.asc(), Slot.id.asc()).all()
         return jsonify({"slots": [
-            {"id": r["id"], "provider": r["provider"], "start": r["start"],
-             "end": r["end"], "available": bool(r["available"])}
-            for r in rows
+            {
+                "id": slot.id,
+                "provider": slot.provider,
+                "start": slot.start,
+                "end": slot.end,
+                "available": bool(available),
+            }
+            for slot, available in rows
         ]})
 
     def email_for_rate_limit(payload):
@@ -114,20 +132,54 @@ def create_app(test_config=None):
             return payload["email"].strip().lower()[:320]
         return None
 
-    def record_rate_attempt(db, email):
+    def record_rate_attempt(email):
         now = datetime.now(timezone.utc)
-        cutoff = (now - timedelta(seconds=app.config["RATE_WINDOW_SECONDS"])).timestamp()
         now_ts = now.timestamp()
-        db.execute("DELETE FROM rate_attempts WHERE attempted_at < ?", (cutoff,))
-        rows = db.execute(
-            "SELECT attempted_at FROM rate_attempts WHERE email=? AND attempted_at>=? ORDER BY attempted_at",
-            (email, cutoff),
-        ).fetchall()
-        if len(rows) >= app.config["RATE_LIMIT"]:
-            retry_after = max(1, int(rows[0]["attempted_at"] + app.config["RATE_WINDOW_SECONDS"] - now_ts + 0.999))
+        cutoff = now_ts - app.config["RATE_WINDOW_SECONDS"]
+
+        # PostgreSQL transaction-scoped advisory lock serializes attempts for
+        # one email, including the first attempt when no row exists yet.
+        if db.engine.dialect.name == "postgresql":
+            db.session.execute(
+                text("SELECT pg_advisory_xact_lock(hashtextextended(:email, 0))"),
+                {"email": email},
+            )
+
+        db.session.execute(
+            delete(RateLimitAttempt).where(RateLimitAttempt.attempted_at < cutoff)
+        )
+        attempts = db.session.query(func.count(RateLimitAttempt.id)).filter(
+            RateLimitAttempt.email == email,
+            RateLimitAttempt.attempted_at >= cutoff,
+        ).scalar()
+
+        if attempts >= app.config["RATE_LIMIT"]:
+            oldest = db.session.query(func.min(RateLimitAttempt.attempted_at)).filter(
+                RateLimitAttempt.email == email,
+                RateLimitAttempt.attempted_at >= cutoff,
+            ).scalar()
+            retry_after = max(
+                1,
+                int(oldest + app.config["RATE_WINDOW_SECONDS"] - now_ts + 0.999),
+            )
+            db.session.commit()
             return retry_after
-        db.execute("INSERT INTO rate_attempts (email, attempted_at) VALUES (?, ?)", (email, now_ts))
+
+        db.session.add(RateLimitAttempt(email=email, attempted_at=now_ts))
+        db.session.commit()
         return None
+
+    def save_idempotency(idem_key, body_hash, status_code, response_body):
+        if not idem_key:
+            return
+        db.session.add(IdempotencyRecord(
+            idem_key=idem_key,
+            body_hash=body_hash,
+            status_code=status_code,
+            response_body=response_body,
+            created_at=utc_now(),
+        ))
+        db.session.commit()
 
     @app.post("/bookings")
     def create_booking():
@@ -135,39 +187,33 @@ def create_app(test_config=None):
         if not isinstance(payload, dict):
             return error("request body must be a JSON object", 400)
 
-        # Idempotency replay is checked before rate limiting so a retry returns
-        # the exact original response and does not create or consume another attempt.
         idem_key = request.headers.get("Idempotency-Key")
         body_canonical = canonical_json(payload)
         body_hash = hashlib.sha256(body_canonical.encode("utf-8")).hexdigest()
 
-        db = get_db(app)
         if idem_key:
-            existing = db.execute(
-                "SELECT body_hash, status_code, response_body FROM idempotency WHERE idem_key=?",
-                (idem_key,),
-            ).fetchone()
+            existing = db.session.get(IdempotencyRecord, idem_key)
             if existing:
-                if existing["body_hash"] != body_hash:
+                if existing.body_hash != body_hash:
                     return error("Idempotency-Key was already used with a different request body", 422)
-                return app.response_class(existing["response_body"], status=existing["status_code"],
-                                          mimetype="application/json")
+                return app.response_class(
+                    existing.response_body,
+                    status=existing.status_code,
+                    mimetype="application/json",
+                )
 
         rate_email = email_for_rate_limit(payload)
         if rate_email:
             try:
-                db.execute("BEGIN IMMEDIATE")
-                retry_after = record_rate_attempt(db, rate_email)
-                db.commit()
+                retry_after = record_rate_attempt(rate_email)
             except Exception:
-                db.rollback()
+                db.session.rollback()
                 raise
             if retry_after is not None:
                 response, status = error("too many booking attempts; try again later", 429)
                 response.headers["Retry-After"] = str(retry_after)
                 return response, status
 
-        # Level 2 validation
         for field in ("slot_id", "name", "email"):
             if not isinstance(payload.get(field), str) or not payload[field].strip():
                 return error(f"{field} is required", 400)
@@ -180,47 +226,74 @@ def create_app(test_config=None):
         except EmailNotValidError:
             return error("email is invalid", 400)
 
-        # BEGIN IMMEDIATE serializes writers. The unique partial index is a
-        # second line of defence against two confirmed bookings for one slot.
+        result = None
+        response_body = None
         try:
-            db.execute("BEGIN IMMEDIATE")
-            slot = db.execute("SELECT * FROM slots WHERE id=?", (slot_id,)).fetchone()
+            # Acquire a write lock on the slot before checking availability.
+            # This serializes competing bookings on SQLite and locks the row
+            # on PostgreSQL. The partial unique index remains the final guard.
+            db.session.execute(
+                update(Slot).where(Slot.id == slot_id).values(id=Slot.id)
+            )
+            slot = db.session.get(Slot, slot_id)
             if not slot:
                 result = ({"error": "slot not found"}, 404)
             else:
-                start = parse_datetime(slot["start"])
+                start = parse_datetime(slot.start)
                 if start <= datetime.now(timezone.utc):
                     result = ({"error": "slot has already started"}, 400)
                 else:
-                    occupied = db.execute(
-                        "SELECT id FROM bookings WHERE slot_id=? AND status='confirmed'", (slot_id,)
-                    ).fetchone()
+                    occupied = db.session.query(Booking.id).filter(
+                        Booking.slot_id == slot_id,
+                        Booking.status == "confirmed",
+                    ).first()
                     if occupied:
                         result = ({"error": "slot already booked"}, 409)
                     else:
-                        booking = {
-                            "id": str(uuid.uuid4()),
-                            "slot_id": slot_id,
-                            "name": name,
-                            "email": email,
-                            "status": "confirmed",
-                            "created_at": utc_now(),
-                        }
-                        db.execute("""
-                            INSERT INTO bookings (id, slot_id, name, email, status, created_at)
-                            VALUES (?, ?, ?, ?, 'confirmed', ?)
-                        """, (booking["id"], slot_id, name, email, booking["created_at"]))
-                        result = (booking, 201)
+                        booking = Booking(
+                            id=str(uuid.uuid4()),
+                            slot_id=slot_id,
+                            name=name,
+                            email=email,
+                            status="confirmed",
+                            created_at=utc_now(),
+                        )
+                        db.session.add(booking)
+                        db.session.flush()
+                        result = ({
+                            "id": booking.id,
+                            "slot_id": booking.slot_id,
+                            "name": booking.name,
+                            "email": booking.email,
+                            "status": booking.status,
+                            "created_at": booking.created_at,
+                        }, 201)
+
             response_body = json.dumps(result[0], separators=(",", ":"))
-            if idem_key:
-                db.execute("""
-                    INSERT INTO idempotency (idem_key, body_hash, status_code, response_body, created_at)
-                    VALUES (?, ?, ?, ?, ?)
-                """, (idem_key, body_hash, result[1], response_body, utc_now()))
-            db.commit()
+            db.session.commit()
+        except IntegrityError:
+            # The partial unique index is the final guard against two requests
+            # confirming the same slot at the same time.
+            db.session.rollback()
+            result = ({"error": "slot already booked"}, 409)
+            response_body = json.dumps(result[0], separators=(",", ":"))
         except Exception:
-            db.rollback()
+            db.session.rollback()
             raise
+
+        if idem_key:
+            try:
+                save_idempotency(idem_key, body_hash, result[1], response_body)
+            except IntegrityError:
+                db.session.rollback()
+                existing = db.session.get(IdempotencyRecord, idem_key)
+                if existing and existing.body_hash == body_hash:
+                    return app.response_class(
+                        existing.response_body,
+                        status=existing.status_code,
+                        mimetype="application/json",
+                    )
+                return error("Idempotency-Key was already used with a different request body", 422)
 
         return app.response_class(response_body, status=result[1], mimetype="application/json")
 
@@ -234,75 +307,89 @@ def create_app(test_config=None):
         except EmailNotValidError:
             return error("email is invalid", 400)
 
-        limit_raw = request.args.get("limit", "10")
+        email = email.strip().lower()
         try:
-            limit = int(limit_raw)
+            limit = int(request.args.get("limit", "10"))
         except (TypeError, ValueError):
             return error("limit must be between 1 and 50", 400)
-        if limit < 1 or limit > 50:
+        if not 1 <= limit <= 50:
             return error("limit must be between 1 and 50", 400)
 
         cursor = request.args.get("cursor")
-        db = get_db(app)
-        params = [email.strip().lower()]
-        where = "WHERE lower(email)=?"
+        query = Booking.query.filter(func.lower(Booking.email) == email)
         if cursor:
-            # Cursor is the last booking id returned. It is scoped to the email.
-            cursor_row = db.execute(
-                "SELECT created_at, id FROM bookings WHERE id=? AND lower(email)=?",
-                (cursor, email.strip().lower()),
-            ).fetchone()
+            cursor_row = Booking.query.filter(
+                Booking.id == cursor,
+                func.lower(Booking.email) == email,
+            ).first()
             if not cursor_row:
                 return error("invalid cursor", 400)
-            where += " AND (created_at > ? OR (created_at = ? AND id > ?))"
-            params.extend([cursor_row["created_at"], cursor_row["created_at"], cursor_row["id"]])
+            query = query.filter(
+                (Booking.created_at > cursor_row.created_at)
+                | (
+                    (Booking.created_at == cursor_row.created_at)
+                    & (Booking.id > cursor_row.id)
+                )
+            )
 
-        rows = db.execute(
-            f"SELECT * FROM bookings {where} ORDER BY created_at ASC, id ASC LIMIT ?",
-            (*params, limit + 1),
-        ).fetchall()
+        rows = query.order_by(
+            Booking.created_at.asc(), Booking.id.asc()
+        ).limit(limit + 1).all()
+
         has_more = len(rows) > limit
         page = rows[:limit]
-        bookings = [booking_dict(r) for r in page]
-        next_cursor = page[-1]["id"] if has_more and page else None
-        return jsonify({"bookings": bookings, "next_cursor": next_cursor})
+        next_cursor = page[-1].id if has_more and page else None
+        return jsonify({
+            "bookings": [booking_dict(row) for row in page],
+            "next_cursor": next_cursor,
+        })
 
     @app.get("/bookings/<booking_id>")
     def get_booking(booking_id):
-        row = get_db(app).execute("SELECT * FROM bookings WHERE id=?", (booking_id,)).fetchone()
+        row = db.session.get(Booking, booking_id)
         if not row:
             return error("booking not found", 404)
         return jsonify(booking_dict(row))
 
     @app.delete("/bookings/<booking_id>")
     def cancel_booking(booking_id):
-        db = get_db(app)
+        # Lock the booking row before reading/updating its status. This avoids
+        # two concurrent cancellation requests both reporting success.
+        db.session.execute(
+            update(Booking).where(Booking.id == booking_id).values(status=Booking.status)
+        )
+        row = db.session.get(Booking, booking_id)
+        if not row:
+            return error("booking not found", 404)
+        if row.status == "cancelled":
+            return error("booking already cancelled", 409)
+        row.status = "cancelled"
         try:
-            db.execute("BEGIN IMMEDIATE")
-            row = db.execute("SELECT * FROM bookings WHERE id=?", (booking_id,)).fetchone()
-            if not row:
-                db.rollback()
-                return error("booking not found", 404)
-            if row["status"] == "cancelled":
-                db.rollback()
-                return error("booking already cancelled", 409)
-            db.execute("UPDATE bookings SET status='cancelled' WHERE id=?", (booking_id,))
-            updated = db.execute("SELECT * FROM bookings WHERE id=?", (booking_id,)).fetchone()
-            db.commit()
-            return jsonify(booking_dict(updated))
+            db.session.commit()
         except Exception:
-            db.rollback()
+            db.session.rollback()
             raise
+        return jsonify(booking_dict(row))
 
     return app
 
+
 def booking_dict(row):
     return {
-        "id": row["id"], "slot_id": row["slot_id"], "name": row["name"],
-        "email": row["email"], "status": row["status"], "created_at": row["created_at"]
+        "id": row.id,
+        "slot_id": row.slot_id,
+        "name": row.name,
+        "email": row.email,
+        "status": row.status,
+        "created_at": row.created_at,
     }
+
 
 app = create_app()
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=int(os.environ.get("PORT", "5000")), debug=os.environ.get("FLASK_DEBUG") == "1")
+    app.run(
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", "5000")),
+        debug=os.environ.get("FLASK_DEBUG") == "1",
+    )

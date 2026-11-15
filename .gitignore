@@ -1,20 +1,12 @@
-# Environment variables and secrets
 .env
 .env.*
-
-# Allow the example environment file
 !.env.example
-
-# Python
 __pycache__/
 *.py[cod]
 .venv/
 venv/
-
-# SQLite database files
-*.db
+.pytest_cache/
+instance/
 *.sqlite
 *.sqlite3
-
-# Test/cache files
-.pytest_cache/
+*.db
