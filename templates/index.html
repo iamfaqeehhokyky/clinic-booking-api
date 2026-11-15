@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Clinic appointment booking</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<header class="topbar"><div class="brand-mark">+</div><div><strong>SulaimonOlanrewaju Clinic</strong><span>Appointment booking</span></div></header>
+<main class="container">
+  <section class="intro">
+    <p class="eyebrow">PATIENT PORTAL</p>
+    <h1>Book your appointment</h1>
+    <p>Choose an available time with one of our healthcare providers.</p>
+  </section>
+
+  <section class="panel api-panel">
+    <label for="apiKey">API key</label>
+    <div class="inline"><input id="apiKey" type="password" autocomplete="off" placeholder="Enter the API key configured on the server"><button id="saveKey" class="button secondary">Use key</button></div>
+    <small>The key is used by this browser to authenticate API requests!</small>
+  </section>
+
+  <div class="content-grid">
+    <section class="panel">
+      <div class="section-heading"><div><p class="eyebrow">AVAILABLE TIMES</p><h2>Appointment slots</h2></div><button id="refresh" class="button secondary">Refresh</button></div>
+      <div id="slots" class="slots"><p class="muted">Enter your API key to load appointment slots.</p></div>
+    </section>
+    <section class="panel booking-panel">
+      <p class="eyebrow">YOUR DETAILS</p><h2>Confirm a booking</h2>
+      <form id="bookingForm">
+        <label for="selectedSlot">Selected slot</label><input id="selectedSlot" readonly placeholder="Choose a slot on the left" required>
+        <label for="patientName">Full name</label><input id="patientName" maxlength="120" required placeholder="e.g. Sulaimon Olanrewaju">
+        <label for="patientEmail">Email address</label><input id="patientEmail" type="email" maxlength="254" required placeholder="sulaimon@domain.com">
+        <button class="button primary full" type="submit">Book appointment</button>
+      </form>
+      <div id="notice" class="notice" aria-live="polite"></div>
+      <div id="confirmation" class="confirmation" hidden></div>
+    </section>
+  </div>
+
+  <section class="panel history-panel">
+    <div class="section-heading"><div><p class="eyebrow">BOOKING MANAGEMENT</p><h2>Find your bookings</h2></div></div>
+    <form id="historyForm" class="inline"><input id="historyEmail" type="email" required placeholder="Enter the email used to book"><button class="button secondary">Find bookings</button></form>
+    <div id="history" class="history-list"></div>
+  </section>
+  <footer>Sulaimon Olanrewaju Clinic booking demo · Flask + SQLite</footer>
+</main>
+<script src="{{ url_for('static', filename='script.js') }}"></script>
+</body>
+</html>
